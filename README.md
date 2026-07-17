@@ -26,6 +26,13 @@ live thread, that thread breaks. A *clone* only ever **reads** the source and
 **writes** a fresh copy with a new identity, so the worst case leaves your
 original untouched.
 
+## Requirements
+
+- **macOS** — the tile and transcript paths are macOS-specific
+  (`~/Library/Application Support/Claude/…`).
+- **Python 3.6+** — standard library only, no dependencies.
+- **Claude Code Desktop**.
+
 ## Usage
 
 ```
