@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""clone-thread — 把一條 Claude Desktop thread 複製到另一個資料夾。
+
+  用法: clone-thread <來源 tile 的路徑> <目標 cwd>
+
+三步,沒有第四步。要複製哪個檔、抄哪個 tile,答案全在來源 tile 裡 ——
+程式不做任何判斷,也沒有任何需要呼叫者判斷才能回答的參數。
+
+  1. 讀來源 tile → 拿 cliSessionId(要複製的那個檔)、cwd、title
+  2. 逐行複製那一個 jsonl,只改 sessionId 和 cwd 兩個欄位
+  3. 抄來源 tile,換身分欄位、清掉屬於來源處境的欄位,存成新 tile
+
+**跑完要重開 Claude Desktop 才看得到。** app.asar 裡 loadSessions() 只在啟動/切帳號時跑,
+session 目錄沒有任何 watcher —— 執行中的 App 不會發現新 tile。
+
+「複製」指的是內容語意完全相同,不是 byte 相同:這裡用 json.dumps 重新序列化,
+空格排版跟 Desktop 的緊湊 JSON 不同,檔案會漲約 1.4%。
+"""
+import json, os, re, sys, time, uuid
+
+PROJ = os.path.expanduser("~/.claude/projects")
+
+# tile 上「屬於來源的處境」的欄位,不是這條對話的內容 —— clone 不准繼承。
+# 權限尤其危險:那是使用者為了「來源那個資料夾」一次次點頭換來的,
+# 照抄過去等於 clone 一出生就在新位置白拿全部授權、零詢問。
+NOT_INHERITED = (
+    # 權限:使用者為了「來源那個資料夾」一次次點頭換來的
+    "permissionMode", "chromePermissionMode", "chromeAllowedDomains",
+    "alwaysAllowedReasons", "sessionPermissionUpdates",
+    "cuAllowedApps", "cuGrantFlags", "tccFolderKind",
+    # 執行環境:persistedToActive 會拿它們決定 backend.kind —— 繼承了就是 clone 到本機
+    # 卻還連著來源的 SSH / WSL
+    "sshConfig", "wslConfig",
+    # git / PR 身分
+    "branch", "sourceBranch", "writtenBranches", "worktreeName", "worktreePath",
+    "worktreePinned", "prNumber", "prUrl", "prRepository", "prState", "prs",
+    # 來源的計數器與掛勾
+    "completedTurns", "lastFocusedAt", "chromeTabGroupId", "spawnSeed",
+    "scheduledTaskId", "planPath",
+    "transcriptUnavailable", "error", "errorAt", "contextExceededCount",
+)
+
+
+def slug(cwd):
+    """cwd → ~/.claude/projects 底下的資料夾名。
+
+    逐字翻自 app.asar,不是自己發明的 —— 算出來跟 Claude 不一樣,thread 就找不到:
+
+        function QU(e){let t=0;for(let r=0;r<e.length;r++)t=(t<<5)-t+e.charCodeAt(r)|0;return t}
+        function sD(e){return Math.abs(QU(e)).toString(36)}
+        function ms(e){let t=e.replace(/[^a-zA-Z0-9]/g,"-");
+                       return t.length<=Va?t:`${t.slice(0,Va)}-${sD(e)}`}      // Va = 200
+
+    注意雜湊吃的是**原字串** e,不是換過 "-" 的 t。
+    """
+    s = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+    if len(s) <= 200:
+        return s
+    # QU(e) 逐字元 hash。JS 的 charCodeAt 回 UTF-16 code unit,不是 codepoint ——
+    # emoji 之類的非 BMP 字元會被拆成兩個 unit。Python 的 ord() 只給一個,直接用會算錯,
+    # thread 靜靜消失。所以先轉成 UTF-16 code unit 再 hash。
+    u16 = cwd.encode("utf-16-le")
+    units = [int.from_bytes(u16[b:b+2], "little") for b in range(0, len(u16), 2)]
+    h = 0
+    for u in units:                                 # (t<<5)-t = t*31;|0 = 32 位有號截斷
+        h = (((h << 5) - h + u) & 0xFFFFFFFF)
+        h = h - 0x100000000 if h >= 0x80000000 else h
+    n, b36 = abs(h), ""
+    while n:
+        n, r = divmod(n, 36)
+        b36 = "0123456789abcdefghijklmnopqrstuvwxyz"[r] + b36
+    return f"{s[:200]}-{b36 or '0'}"
+
+
+def load(path):
+    """整份讀進來。壞行不准靜默跳過 —— 那會少一句對話還印成功。"""
+    out = []
+    for i, line in enumerate(open(path, encoding="utf-8", errors="replace"), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception as e:
+            raise SystemExit(f"{path} 第 {i} 行不是合法 JSON,無法完整複製:{e}")
+    return out
+
+
+def main():
+    if len(sys.argv) != 3:
+        raise SystemExit(__doc__)
+    src_tile_path, target_cwd = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
+
+    # 0) 三個先決條件。不成立就吵,不准靜默產出一條開不起來的 thread。
+    #    這三個都是實際炸過的:目標資料夾不在 -> Desktop 顯示「Session not found on disk」;
+    #    tile 被 App 卸過 cliSessionId -> 沒東西可抄;來源檔不在 -> 抄出一個空殼還報成功。
+    tile = json.load(open(src_tile_path, encoding="utf-8"))
+    src_session, src_cwd = tile.get("cliSessionId"), tile.get("cwd")
+    if not src_session:
+        raise SystemExit(f"來源 tile 沒有 cliSessionId(被 App 卸掉了?):{src_tile_path}")
+    if not src_cwd:
+        raise SystemExit(f"來源 tile 沒有 cwd:{src_tile_path}")
+    if not os.path.isdir(target_cwd):
+        raise SystemExit(f"目標資料夾不存在:{target_cwd}\n"
+                         f"(Desktop 打開 thread 時會去這個資料夾;它不在,thread 就開不起來。"
+                         f"要先自己建好,程式不替你動你的檔案系統。)")
+    # 正規化目標:tile.cwd 和 transcript 資料夾都用同一個 realpath,不管 Desktop 讀的時候
+    # 有沒有把路徑 realpath,兩邊都對得上(realpath 是冪等的)。對沒有 symlink 的正常
+    # workspace,realpath 就是它自己,零改變 —— 這一步只在目標落在 symlink(如 /tmp)底下時有意義。
+    # 來源不 realpath:CLI 當初是用邏輯路徑建來源資料夾的(實測 -tmp-throwaway 內含 cwd=/tmp/throwaway)。
+    target_cwd = os.path.realpath(target_cwd)
+    src_jsonl = os.path.join(PROJ, slug(src_cwd), src_session + ".jsonl")
+    if not os.path.isfile(src_jsonl):
+        raise SystemExit(f"來源 transcript 不存在:{src_jsonl}")
+
+    new_session = str(uuid.uuid4())
+    target_jsonl = os.path.join(PROJ, slug(target_cwd), new_session + ".jsonl")
+
+    # 2) 逐行照抄 tile 指的那一個檔 —— 那就是 Desktop 顯示這條 thread 時讀的檔。
+    # 不排序:實測原版的 timestamp 不是單調遞增的(某條 3099 行裡有 152 處往回跳),
+    # 拿 timestamp 排序會把同一毫秒內的行洗牌。檔案的行序就是真相。
+    rows = load(src_jsonl)
+    # 只換身分,其他一個 byte 都不動。特別是 parentUuid:compact 邊界靠 parentUuid=None
+    # 把鏈截短,重寫它會把整份歷史接成一條不斷的鏈。
+    os.makedirs(os.path.dirname(target_jsonl), exist_ok=True)
+    with open(target_jsonl, "w", encoding="utf-8") as fo:
+        for row in rows:
+            row["sessionId"] = new_session
+            cwd = row.get("cwd")
+            # 一條 thread 裡的 cwd 可能是來源目錄本身,也可能是它底下的 worktree
+            # (實測某條 3099 行裡 2614 行是 worktree 子路徑)。整棵子樹跟著 thread 搬;
+            # 只比對「完全相等」會漏掉 84%,留下指向來源的死路徑。
+            if isinstance(cwd, str) and (cwd == src_cwd or cwd.startswith(src_cwd + os.sep)):
+                row["cwd"] = target_cwd + cwd[len(src_cwd):]
+            fo.write(json.dumps(row, ensure_ascii=False) + "\n")
+    n = len(rows)
+
+    # 3) 抄來源自己的 tile(不是別條的),只改身分欄位。
+    #    tile 檔名必須等於 sessionId,jsonl 檔名必須等於 cliSessionId —— 不合 App 會拒收。
+    new_tile_id = "local_" + str(uuid.uuid4())
+    tile["sessionId"] = new_tile_id
+    tile["cliSessionId"] = new_session
+    tile["cwd"] = tile["originCwd"] = target_cwd
+    tile["title"] = tile.get("title", "") + " (clone)"
+    # 這條 clone 是「現在」出生的,不是來源那天 —— App 自己建 session 時就是寫 Date.now()。
+    # 側邊欄照 lastActivityAt 由新到舊排,抄來源的日期會讓它排到來源那天,你就找不到它。
+    tile["createdAt"] = tile["lastActivityAt"] = int(time.time() * 1000)
+    tile["isArchived"] = False        # 來源可能是封存的;clone 不該一出生就看不見
+    tile["bridgeSessionIds"] = []     # Remote Control 的 API session id —— 那是來源的,不是這條的
+    for k in NOT_INHERITED:
+        tile.pop(k, None)
+    tile_path = os.path.join(os.path.dirname(src_tile_path), new_tile_id + ".json")
+    with open(tile_path, "w", encoding="utf-8") as f:
+        json.dump(tile, f, ensure_ascii=False, indent=2)
+
+    print(f"  來源  {src_session[:8]}  {src_cwd}")
+    print(f"  clone {new_session[:8]}  {target_cwd}  ({n} 行)")
+    print(f"  tile  {os.path.basename(tile_path)}")
+    print(f"  標題  {tile['title']!r}")
+
+
+if __name__ == "__main__":
+    main()
